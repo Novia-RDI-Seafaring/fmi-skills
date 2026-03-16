@@ -6,6 +6,5 @@
     "name": "Christoffer Björkskog",
     "email": "christoffer.bjorkskog@novia.fi"
   },
-  "keywords": ["fmu", "fmpy", "fmi", "simulation", "control", "modelica"],
-  "category": "engineering"
+  "keywords": ["fmu", "fmpy", "fmi", "simulation", "control", "modelica"]
 }
