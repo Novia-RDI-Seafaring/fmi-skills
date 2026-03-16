@@ -144,7 +144,7 @@ for col in outputs:
     unit = unit_map.get(col, "")
     print(f"  {col:<22} {vals.min():>10.4f} {vals.max():>10.4f} {vals[-1]:>10.4f}  {unit}")
 
-# ── 9. Plot ───────────────────────────────────────────────────────────────────
+# ── 9. Static plot (PNG) ──────────────────────────────────────────────────────
 n = len(outputs)
 fig, axes = plt.subplots(n, 1, figsize=(11, 3.2 * n), sharex=True)
 if n == 1:
@@ -166,19 +166,114 @@ plt.tight_layout()
 
 plot_path = OUTPUT_CSV.replace(".csv", ".png")
 plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-print(f"\nPlot saved to: {plot_path}")
+print(f"Plot (PNG) saved to: {plot_path}")
+
+# ── 10. Interactive widget HTML ────────────────────────────────────────────────
+import json
+
+# Downsample to max 500 points to keep widget payload small
+step_n = max(1, len(result) // 500)
+t_data  = result[time_col][::step_n].tolist()
+
+palette = ["#4e8ef7", "#f76e4e", "#4ecf8e", "#f7c94e", "#a44ef7", "#4ef7f0"]
+datasets_js = []
+for i, col in enumerate(outputs):
+    unit  = unit_map.get(col, "")
+    label = f"{col} ({unit})" if unit else col
+    color = palette[i % len(palette)]
+    datasets_js.append({
+        "label":           label,
+        "data":            result[col][::step_n].tolist(),
+        "borderColor":     color,
+        "backgroundColor": color,
+        "borderWidth":     1.5,
+        "pointRadius":     0,
+        "tension":         0.1,
+    })
+
+has_pid_params = any(v.name in ("Kp", "Ki", "Kd", "Ti", "Td") for v in md.modelVariables)
+tune_button = (
+    '<button class="btn" onclick="sendPrompt(\'Tune the PID for this FMU\')">Tune PID</button>'
+    if has_pid_params else ""
+)
+
+widget_html = f"""
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  .wrap{{padding:16px;font-family:var(--font-family,system-ui);color:var(--color-text-primary,#111);background:var(--color-background-primary,#fff)}}
+  .hdr{{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}}
+  .title{{font-size:13px;font-weight:600;color:var(--color-text-primary,#111)}}
+  .sub{{font-size:11px;color:var(--color-text-secondary,#666);margin-top:2px}}
+  .btn{{padding:5px 12px;font-size:12px;border:0.5px solid var(--color-border,#ccc);background:var(--color-background-secondary,#f5f5f5);color:var(--color-text-primary,#111);cursor:pointer;border-radius:4px}}
+  canvas{{width:100%!important}}
+</style>
+<div class="wrap">
+  <div class="hdr">
+    <div>
+      <div class="title">{model_name}</div>
+      <div class="sub">FMI {md.fmiVersion} · {sim_type} · {start_time}s → {stop_time}s · {len(result)} steps</div>
+    </div>
+    {tune_button}
+  </div>
+  <canvas id="simChart"></canvas>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+new Chart(document.getElementById('simChart'),{{
+  type:'line',
+  data:{{
+    labels:{json.dumps([round(x,4) for x in t_data])},
+    datasets:{json.dumps(datasets_js)}
+  }},
+  options:{{
+    animation:false,
+    responsive:true,
+    interaction:{{mode:'index',intersect:false}},
+    plugins:{{
+      legend:{{labels:{{font:{{size:11}},boxWidth:12}}}},
+      tooltip:{{bodyFont:{{size:11}},titleFont:{{size:11}}}}
+    }},
+    scales:{{
+      x:{{title:{{display:true,text:'Time (s)',font:{{size:11}}}},ticks:{{maxTicksLimit:10,font:{{size:10}}}},grid:{{color:'rgba(128,128,128,0.15)'}}}},
+      y:{{ticks:{{font:{{size:10}}}},grid:{{color:'rgba(128,128,128,0.15)'}}}}
+    }}
+  }}
+}});
+</script>
+"""
+
+widget_path = OUTPUT_CSV.replace(".csv", "_widget.html")
+with open(widget_path, "w") as f:
+    f.write(widget_html)
+print(f"Widget HTML saved to: {widget_path}")
 PYEOF
 ```
 
-## Step 3 — Display the plot
+## Step 3 — Display results
 
-After the script completes, use the Read tool to display the PNG image to the user:
+**3a — Static PNG** (always do this first):
 
+Use the Read tool to display the PNG inline in the chat:
 ```
 Read: <plot_path>
 ```
 
-Then give a brief plain-language interpretation of the results — what the outputs represent, whether the simulation looks healthy, and any notable behaviour (e.g. oscillations, settling, saturation).
+**3b — Interactive widget** (do this after the PNG):
+
+Read the widget HTML file, then call `show_widget` with its contents so the user gets an interactive Chart.js chart inline in the chat:
+```
+Read: <widget_path>   → pass contents to show_widget
+```
+
+If `show_widget` is not available (e.g. running in Claude Code terminal only), open the widget in the browser instead:
+```bash
+open <widget_path>   # macOS
+xdg-open <widget_path>   # Linux
+```
+
+**3c — Interpretation**
+
+Give a brief plain-language summary: what the outputs represent, whether the simulation looks healthy, and any notable behaviour (oscillations, settling, saturation, drift).
 
 ## Step 4 — Handle errors
 
