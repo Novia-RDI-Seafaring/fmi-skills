@@ -1,219 +1,307 @@
 ---
 name: fmpy-simulate
-description: Run an FMPy simulation for a given FMU file. Use when the user wants to simulate an FMU, run a Functional Mock-up Unit, or work with FMI-based models.
+description: Run an FMPy simulation for a given FMU file. Use when the user wants to simulate an FMU, run a Functional Mock-up Unit, or work with FMI-based models. Also handles follow-up messages from the simulation config widget (messages starting with "SIMULATE:").
 disable-model-invocation: false
 user-invocable: true
-argument-hint: <path-to-fmu> [start=0] [stop=10] [step=0.01] [out=/tmp/results.csv]
+argument-hint: <path-to-fmu>
 allowed-tools: Bash, Read, Glob
 ---
 
 # FMPy FMU Simulation
 
-> **What is an FMU?** A Functional Mock-up Unit (FMU) is a simulation model in a standardised format (FMI standard). It can represent control systems, physical models, or entire plants. FMPy is a Python tool for running these models.
+> **What is an FMU?** A Functional Mock-up Unit (FMU) is a self-contained simulation model in the FMI standard format. It can represent physical systems, control loops, or entire plants. FMPy is a Python tool for running these models without installing any simulator software.
 
-## Step 1 — Parse arguments
+---
 
-Extract from `$ARGUMENTS`:
-- `FMU_PATH` — path to the `.fmu` file (required, first positional arg)
-- `start` — simulation start time in seconds (default: read from FMU, fallback `0.0`)
-- `stop` — simulation stop time in seconds (default: read from FMU, fallback `10.0`)
-- `step` — output interval / step size in seconds (default: read from FMU, fallback `0.01`)
-- `out` — output CSV path (default: `/tmp/<fmu-name>_results.csv`)
+## Phase detection
 
-If no FMU path is provided, ask the user for one. If the path doesn't end in `.fmu`, use the Glob tool to search nearby for `.fmu` files and suggest them.
+Check `$ARGUMENTS`:
 
-## Step 2 — Run everything in one script
+- If it starts with `SIMULATE:` → this is a **Phase 2** call from the widget button. Jump to **Phase 2**.
+- Otherwise → this is a **Phase 1** call. Proceed below.
 
-Use a single `uv run` invocation — this handles all dependencies automatically with no manual installation needed.
+---
+
+## Phase 1 — Inspect FMU and show configuration widget
+
+### Step 1 — Resolve FMU path
+
+Extract `FMU_PATH` as the first argument. If missing or not ending in `.fmu`, use the Glob tool to find `.fmu` files nearby and ask the user to pick one.
+
+### Step 2 — Inspect the FMU
+
+```bash
+uv run --with fmpy python3 - <<'PYEOF'
+import sys, os, json
+from fmpy import read_model_description, dump, supported_platforms
+import platform as _platform
+
+FMU_PATH = "$FMU_PATH"
+
+if not os.path.isfile(FMU_PATH):
+    print(f"ERROR: File not found: {FMU_PATH}"); sys.exit(1)
+
+dump(FMU_PATH)
+md = read_model_description(FMU_PATH)
+
+# Platform check
+system = _platform.system().lower()
+os_tag = "darwin64" if system == "darwin" else "linux64" if system == "linux" else "win64"
+sp = supported_platforms(FMU_PATH)
+if sp and os_tag not in sp and "c-code" not in sp:
+    print(f"\nERROR: FMU supports {sp}, cannot run on {os_tag}."); sys.exit(1)
+
+# Collect variables by role
+de    = md.defaultExperiment
+inputs  = [v for v in md.modelVariables if v.causality == 'input']
+params  = [v for v in md.modelVariables if v.causality == 'parameter']
+outputs = [v for v in md.modelVariables if v.causality == 'output']
+
+sim_type   = "CoSimulation" if md.coSimulation else "ModelExchange"
+start_time = float(de.startTime) if de and de.startTime is not None else 0.0
+stop_time  = float(de.stopTime)  if de and de.stopTime  is not None else 10.0
+step_size  = float(de.stepSize)  if de and de.stepSize  is not None else 0.01
+
+info = {
+    "fmu_path": FMU_PATH,
+    "model_name": md.modelName,
+    "fmi_version": md.fmiVersion,
+    "sim_type": sim_type,
+    "start": start_time,
+    "stop": stop_time,
+    "step": step_size,
+    "inputs": [{"name": v.name, "start": v.start, "unit": v.unit or "", "desc": v.description or ""} for v in inputs],
+    "params": [{"name": v.name, "start": v.start, "unit": v.unit or "", "desc": v.description or ""} for v in params],
+    "outputs": [{"name": v.name, "unit": v.unit or "", "desc": v.description or ""} for v in outputs],
+}
+print("FMUINFO:" + json.dumps(info))
+PYEOF
+```
+
+Capture the line starting with `FMUINFO:` and parse the JSON.
+
+### Step 3 — Discuss the model
+
+Before showing the widget, give the user a short plain-language introduction:
+- What does this model simulate?
+- What are the inputs and tunable parameters — what do they control physically?
+- What will the outputs show?
+- Any tips (e.g. "coefficient of restitution between 0 and 1 — higher means bouncier")
+
+Keep it concise: 3–6 sentences.
+
+### Step 4 — Generate and show the configuration widget
+
+Generate the config widget HTML and call `show_widget` with it. If `show_widget` is not available, save to `/tmp/<model>_config.html` and open it with `open`.
+
+The widget must:
+- Show model name, FMI version, sim type
+- Have number inputs for **start**, **stop**, **step** (pre-filled with FMU defaults)
+- Have number inputs for every **input variable** and **tunable parameter** (pre-filled with their start values)
+- Show unit and description next to each field
+- Have a prominent **▶ Run Simulation** button
+- On click, call `sendPrompt()` with a message encoding all values
+
+```python
+import json
+
+# (use the parsed info dict from Step 2)
+info = <parsed FMUINFO dict>
+
+fmu_path   = info["fmu_path"]
+model_name = info["model_name"]
+sim_type   = info["sim_type"]
+fmi_ver    = info["fmi_version"]
+
+def field_row(var):
+    name  = var["name"]
+    val   = var["start"] if var["start"] is not None else 0
+    unit  = var["unit"]
+    desc  = var["desc"]
+    return f"""
+    <div class="row">
+      <span class="name" title="{desc}">{name}</span>
+      <input class="inp" id="p_{name}" type="number" value="{val}" step="any">
+      <span class="unit">{unit}</span>
+      <span class="desc">{desc}</span>
+    </div>"""
+
+input_rows = "".join(field_row(v) for v in info["inputs"])
+param_rows = "".join(field_row(v) for v in info["params"])
+
+all_var_names = [v["name"] for v in info["inputs"]] + [v["name"] for v in info["params"]]
+collect_js = " + ".join([f'"&{n}=" + document.getElementById("p_{n}").value' for n in all_var_names]) if all_var_names else '""'
+
+widget_html = f"""
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  .wrap{{padding:16px;font-family:var(--font-family,system-ui);color:var(--color-text-primary,#111);background:var(--color-background-primary,#fff);max-width:600px}}
+  .hdr{{margin-bottom:14px}}
+  .title{{font-size:14px;font-weight:700}}
+  .sub{{font-size:11px;color:var(--color-text-secondary,#666);margin-top:3px}}
+  .section-label{{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--color-text-secondary,#888);margin:14px 0 6px}}
+  .row{{display:grid;grid-template-columns:130px 90px 40px 1fr;align-items:center;gap:6px;margin-bottom:6px}}
+  .name{{font-size:12px;font-weight:500}}
+  .inp{{padding:3px 6px;font-size:12px;border:0.5px solid var(--color-border,#ccc);background:var(--color-background-secondary,#f5f5f5);color:var(--color-text-primary,#111);border-radius:3px;width:100%}}
+  .unit{{font-size:11px;color:var(--color-text-secondary,#888)}}
+  .desc{{font-size:11px;color:var(--color-text-secondary,#888);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+  .divider{{border:none;border-top:0.5px solid var(--color-border,#e5e5e5);margin:14px 0}}
+  .btn{{width:100%;padding:9px;font-size:13px;font-weight:600;border:0.5px solid var(--color-border,#ccc);background:var(--color-background-secondary,#f5f5f5);color:var(--color-text-primary,#111);cursor:pointer;border-radius:4px;margin-top:14px}}
+</style>
+<div class="wrap">
+  <div class="hdr">
+    <div class="title">{model_name}</div>
+    <div class="sub">FMI {fmi_ver} · {sim_type}</div>
+  </div>
+
+  <div class="section-label">Simulation Time</div>
+  <div class="row"><span class="name">Start</span><input class="inp" id="start" type="number" value="{info['start']}" step="any"><span class="unit">s</span><span class="desc"></span></div>
+  <div class="row"><span class="name">Stop</span><input class="inp" id="stop" type="number" value="{info['stop']}" step="any"><span class="unit">s</span><span class="desc"></span></div>
+  <div class="row"><span class="name">Step size</span><input class="inp" id="step" type="number" value="{info['step']}" step="any"><span class="unit">s</span><span class="desc"></span></div>
+
+  {'<hr class="divider"><div class="section-label">Input Variables</div>' + input_rows if info["inputs"] else ""}
+  {'<hr class="divider"><div class="section-label">Tunable Parameters</div>' + param_rows if info["params"] else ""}
+
+  <button class="btn" onclick="runSim()">&#9654; Run Simulation</button>
+</div>
+<script>
+function runSim() {{
+  var start = document.getElementById('start').value;
+  var stop  = document.getElementById('stop').value;
+  var step  = document.getElementById('step').value;
+  var extra = {collect_js};
+  sendPrompt('SIMULATE:{fmu_path} start=' + start + ' stop=' + stop + ' step=' + step + extra);
+}}
+</script>
+"""
+
+widget_path = "/tmp/" + "{model_name}".replace(" ", "_") + "_config.html"
+with open(widget_path, "w") as f:
+    f.write(widget_html)
+print(widget_path)
+```
+
+Call `show_widget` with the widget HTML. Then ask the user to review the parameters and click **▶ Run Simulation** when ready.
+
+---
+
+## Phase 2 — Run simulation and show results
+
+Triggered when `$ARGUMENTS` starts with `SIMULATE:`.
+
+### Step 1 — Parse the message
+
+The format is:
+```
+SIMULATE:<fmu_path> start=X stop=Y step=Z [param1=V1] [param2=V2] ...
+```
+
+Extract:
+- `FMU_PATH` — the path after `SIMULATE:`
+- `start`, `stop`, `step` — simulation time settings
+- All remaining `key=value` pairs → `start_values` dict (parameter overrides)
+
+### Step 2 — Run the simulation
 
 ```bash
 uv run --with fmpy --with matplotlib python3 - <<'PYEOF'
-import sys, os
-import numpy as np
-import matplotlib
+import sys, os, json, numpy as np, matplotlib, platform as _platform
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from fmpy import read_model_description, dump, supported_platforms
+from fmpy import read_model_description, supported_platforms
 from fmpy.simulation import simulate_fmu
-import platform as _platform
 
-FMU_PATH        = "$FMU_PATH"
-start_arg       = "$start"   # empty string if not provided
-stop_arg        = "$stop"
-step_arg        = "$step"
-OUTPUT_CSV      = "$out"
-
-# ── 1. Check file exists ─────────────────────────────────────────────────────
-if not os.path.isfile(FMU_PATH):
-    print(f"ERROR: FMU file not found: {FMU_PATH}", file=sys.stderr)
-    sys.exit(1)
-
-# ── 2. Read model description ─────────────────────────────────────────────────
-print("=" * 60)
-print("FMU MODEL INFO")
-print("=" * 60)
-dump(FMU_PATH)
+FMU_PATH    = "$FMU_PATH"
+start_time  = $start
+stop_time   = $stop
+step_size   = $step
+start_values = $start_values_dict   # e.g. {"g": -5.0, "e": 0.9}
+OUTPUT_CSV  = "/tmp/$MODEL_NAME_results.csv"
 
 md = read_model_description(FMU_PATH)
+sim_type = "CoSimulation" if md.coSimulation else "ModelExchange"
+unit_map = {v.name: (v.unit or "") for v in md.modelVariables}
+model_name = md.modelName
 
-# ── 2b. List tunable parameters ───────────────────────────────────────────────
-params = [v for v in md.modelVariables if v.causality == 'parameter']
-if params:
-    print("\nTunable Parameters")
-    print(f"  {'Name':<25} {'Start Value':>15}  {'Unit':<10}  Description")
-    print("  " + "-" * 70)
-    for v in params:
-        val  = v.start if v.start is not None else "—"
-        unit = v.unit  if v.unit  is not None else ""
-        desc = v.description if v.description else ""
-        print(f"  {v.name:<25} {str(val):>15}  {unit:<10}  {desc}")
-else:
-    print("\nNo tunable parameters found.")
+print(f"Running {sim_type}: {start_time}s → {stop_time}s, step={step_size}s")
+if start_values:
+    print(f"Parameter overrides: {start_values}")
 
-# ── 3. Platform check ─────────────────────────────────────────────────────────
-system = _platform.system().lower()
-os_tag = "darwin64" if system == "darwin" else "linux64" if system == "linux" else "win64"
+result = simulate_fmu(
+    FMU_PATH,
+    start_time=start_time,
+    stop_time=stop_time,
+    output_interval=step_size,
+    fmi_type=sim_type,
+    start_values=start_values if start_values else None,
+)
 
-supported = supported_platforms(FMU_PATH)
-if supported and os_tag not in supported and "c-code" not in supported:
-    print(f"\nERROR: This FMU was built for {supported} and cannot run on {os_tag}.")
-    print("You need a version of this FMU compiled for your operating system.")
-    print("Ask the model author to provide a binary for your platform.")
-    sys.exit(1)
-
-# ── 4. Resolve simulation parameters from FMU defaults ───────────────────────
-de = md.defaultExperiment
-start_time      = float(start_arg) if start_arg else (float(de.startTime)  if de and de.startTime  is not None else 0.0)
-stop_time       = float(stop_arg)  if stop_arg  else (float(de.stopTime)   if de and de.stopTime   is not None else 10.0)
-output_interval = float(step_arg)  if step_arg  else (float(de.stepSize)   if de and de.stepSize   is not None else 0.01)
-
-# ── 5. Choose simulation type ─────────────────────────────────────────────────
-if md.coSimulation:
-    sim_type = "CoSimulation"
-elif md.modelExchange:
-    sim_type = "ModelExchange"
-else:
-    print("ERROR: FMU supports neither CoSimulation nor ModelExchange.", file=sys.stderr)
-    sys.exit(1)
-
-# ── 6. Run simulation ─────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("SIMULATION")
-print("=" * 60)
-print(f"  Type     : {sim_type}")
-print(f"  Start    : {start_time} s")
-print(f"  Stop     : {stop_time} s")
-print(f"  Step     : {output_interval} s")
-print(f"  Steps    : {int((stop_time - start_time) / output_interval)}")
-print(f"  Output   : {OUTPUT_CSV}")
-print()
-
-try:
-    result = simulate_fmu(
-        FMU_PATH,
-        start_time=start_time,
-        stop_time=stop_time,
-        output_interval=output_interval,
-        fmi_type=sim_type,
-    )
-except Exception as e:
-    print(f"ERROR during simulation: {e}", file=sys.stderr)
-    print("Suggestions:", file=sys.stderr)
-    print("  - Try a larger step size (e.g. step=0.1)", file=sys.stderr)
-    print("  - Check that the FMU binary matches your OS", file=sys.stderr)
-    sys.exit(1)
-
-# ── 7. Save CSV ───────────────────────────────────────────────────────────────
-os.makedirs(os.path.dirname(OUTPUT_CSV) or ".", exist_ok=True)
 np.savetxt(OUTPUT_CSV, result, delimiter=",",
            header=",".join(result.dtype.names), comments="")
 print(f"Saved {len(result)} rows to: {OUTPUT_CSV}")
 
-# ── 8. Summary statistics ─────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("RESULTS SUMMARY")
-print("=" * 60)
+# ── Static PNG ────────────────────────────────────────────────────────────────
 time_col = result.dtype.names[0]
 outputs  = [n for n in result.dtype.names if n != time_col]
-
-print(f"  {'Variable':<22} {'Min':>10} {'Max':>10} {'Final':>10}  Unit")
-print("  " + "-" * 58)
-unit_map = {v.name: (v.unit or "") for v in md.modelVariables}
-for col in outputs:
-    vals = result[col]
-    unit = unit_map.get(col, "")
-    print(f"  {col:<22} {vals.min():>10.4f} {vals.max():>10.4f} {vals[-1]:>10.4f}  {unit}")
-
-# ── 9. Static plot (PNG) ──────────────────────────────────────────────────────
 n = len(outputs)
 fig, axes = plt.subplots(n, 1, figsize=(11, 3.2 * n), sharex=True)
-if n == 1:
-    axes = [axes]
-
+if n == 1: axes = [axes]
 colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 for i, (ax, col) in enumerate(zip(axes, outputs)):
-    unit = unit_map.get(col, "")
-    label = f"{col} ({unit})" if unit else col
+    unit = unit_map.get(col, ""); label = f"{col} ({unit})" if unit else col
     ax.plot(result[time_col], result[col], color=colors[i % len(colors)], linewidth=1.5)
-    ax.set_ylabel(label)
-    ax.grid(True, alpha=0.4)
-    ax.set_title(col, fontsize=10, loc='right', color='gray')
-
+    ax.set_ylabel(label); ax.grid(True, alpha=0.4)
 axes[-1].set_xlabel("Time (s)")
-model_name = md.modelName or os.path.basename(FMU_PATH).replace(".fmu", "")
 fig.suptitle(f"{model_name}  —  FMI {md.fmiVersion}  {sim_type}", fontsize=13, y=1.01)
 plt.tight_layout()
-
 plot_path = OUTPUT_CSV.replace(".csv", ".png")
 plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-print(f"Plot (PNG) saved to: {plot_path}")
+print(f"PNG: {plot_path}")
 
-# ── 10. Interactive widget HTML ────────────────────────────────────────────────
-import json
+# ── Summary stats ─────────────────────────────────────────────────────────────
+print("\nRESULTS:")
+for col in outputs:
+    vals = result[col]; unit = unit_map.get(col, "")
+    print(f"  {col}: min={vals.min():.4f}  max={vals.max():.4f}  final={vals[-1]:.4f}  {unit}")
 
-# Downsample to max 500 points to keep widget payload small
-step_n = max(1, len(result) // 500)
-t_data  = result[time_col][::step_n].tolist()
-
-palette = ["#4e8ef7", "#f76e4e", "#4ecf8e", "#f7c94e", "#a44ef7", "#4ef7f0"]
-datasets_js = []
+# ── Interactive widget ─────────────────────────────────────────────────────────
+step_n   = max(1, len(result) // 500)
+t_data   = result[time_col][::step_n].tolist()
+palette  = ["#4e8ef7","#f76e4e","#4ecf8e","#f7c94e","#a44ef7","#4ef7f0"]
+datasets = []
 for i, col in enumerate(outputs):
-    unit  = unit_map.get(col, "")
-    label = f"{col} ({unit})" if unit else col
-    color = palette[i % len(palette)]
-    datasets_js.append({
-        "label":           label,
-        "data":            result[col][::step_n].tolist(),
-        "borderColor":     color,
-        "backgroundColor": color,
-        "borderWidth":     1.5,
-        "pointRadius":     0,
-        "tension":         0.1,
-    })
+    unit = unit_map.get(col, ""); label = f"{col} ({unit})" if unit else col
+    datasets.append({"label": label, "data": result[col][::step_n].tolist(),
+        "borderColor": palette[i % len(palette)], "backgroundColor": palette[i % len(palette)],
+        "borderWidth": 1.5, "pointRadius": 0, "tension": 0.1})
 
-has_pid_params = any(v.name in ("Kp", "Ki", "Kd", "Ti", "Td") for v in md.modelVariables)
-tune_button = (
-    '<button class="btn" onclick="sendPrompt(\'Tune the PID for this FMU\')">Tune PID</button>'
-    if has_pid_params else ""
-)
+has_pid = any(v.name in ("Kp","Ki","Kd","Ti","Td") for v in md.modelVariables)
+tune_btn = '<button class="btn" onclick="sendPrompt(\'Tune the PID for this FMU\')">Tune PID</button>' if has_pid else ""
+adjust_btn = f'<button class="btn-sec" onclick="sendPrompt(\'Adjust parameters for {model_name}\')">Adjust Parameters</button>'
+
+override_text = ""
+if start_values:
+    override_text = "  · " + "  ".join(f"{k}={v}" for k,v in start_values.items())
 
 widget_html = f"""
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   .wrap{{padding:16px;font-family:var(--font-family,system-ui);color:var(--color-text-primary,#111);background:var(--color-background-primary,#fff)}}
-  .hdr{{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}}
-  .title{{font-size:13px;font-weight:600;color:var(--color-text-primary,#111)}}
-  .sub{{font-size:11px;color:var(--color-text-secondary,#666);margin-top:2px}}
+  .hdr{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}}
+  .title{{font-size:13px;font-weight:600}}
+  .sub{{font-size:11px;color:var(--color-text-secondary,#666);margin-top:3px}}
+  .actions{{display:flex;gap:6px}}
   .btn{{padding:5px 12px;font-size:12px;border:0.5px solid var(--color-border,#ccc);background:var(--color-background-secondary,#f5f5f5);color:var(--color-text-primary,#111);cursor:pointer;border-radius:4px}}
+  .btn-sec{{padding:5px 12px;font-size:12px;border:0.5px solid var(--color-border,#ccc);background:transparent;color:var(--color-text-secondary,#666);cursor:pointer;border-radius:4px}}
   canvas{{width:100%!important}}
 </style>
 <div class="wrap">
   <div class="hdr">
     <div>
       <div class="title">{model_name}</div>
-      <div class="sub">FMI {md.fmiVersion} · {sim_type} · {start_time}s → {stop_time}s · {len(result)} steps</div>
+      <div class="sub">FMI {md.fmiVersion} · {sim_type} · {start_time}s → {stop_time}s{override_text}</div>
     </div>
-    {tune_button}
+    <div class="actions">{adjust_btn}{tune_btn}</div>
   </div>
   <canvas id="simChart"></canvas>
 </div>
@@ -221,18 +309,9 @@ widget_html = f"""
 <script>
 new Chart(document.getElementById('simChart'),{{
   type:'line',
-  data:{{
-    labels:{json.dumps([round(x,4) for x in t_data])},
-    datasets:{json.dumps(datasets_js)}
-  }},
-  options:{{
-    animation:false,
-    responsive:true,
-    interaction:{{mode:'index',intersect:false}},
-    plugins:{{
-      legend:{{labels:{{font:{{size:11}},boxWidth:12}}}},
-      tooltip:{{bodyFont:{{size:11}},titleFont:{{size:11}}}}
-    }},
+  data:{{labels:{json.dumps([round(x,4) for x in t_data])},datasets:{json.dumps(datasets)}}},
+  options:{{animation:false,responsive:true,interaction:{{mode:'index',intersect:false}},
+    plugins:{{legend:{{labels:{{font:{{size:11}},boxWidth:12}}}},tooltip:{{bodyFont:{{size:11}},titleFont:{{size:11}}}}}},
     scales:{{
       x:{{title:{{display:true,text:'Time (s)',font:{{size:11}}}},ticks:{{maxTicksLimit:10,font:{{size:10}}}},grid:{{color:'rgba(128,128,128,0.15)'}}}},
       y:{{ticks:{{font:{{size:10}}}},grid:{{color:'rgba(128,128,128,0.15)'}}}}
@@ -245,51 +324,36 @@ new Chart(document.getElementById('simChart'),{{
 widget_path = OUTPUT_CSV.replace(".csv", "_widget.html")
 with open(widget_path, "w") as f:
     f.write(widget_html)
-print(f"Widget HTML saved to: {widget_path}")
+print(f"Widget: {widget_path}")
 PYEOF
 ```
 
-## Step 3 — Display results
+### Step 3 — Display results
 
-**3a — Static PNG** (always do this first):
+1. Use the Read tool to show the PNG inline
+2. Read the widget HTML file and call `show_widget` with its contents (or `open` it in the browser as fallback)
+3. Give a plain-language interpretation of the results:
+   - What happened in the simulation?
+   - Are the results as expected?
+   - Note anything interesting (oscillations, settling, instability, steady-state error)
+   - If parameters were overridden, comment on how they affected the outcome
 
-Use the Read tool to display the PNG inline in the chat:
-```
-Read: <plot_path>
-```
+---
 
-**3b — Interactive widget** (do this after the PNG):
+## Error handling
 
-Read the widget HTML file, then call `show_widget` with its contents so the user gets an interactive Chart.js chart inline in the chat:
-```
-Read: <widget_path>   → pass contents to show_widget
-```
+| Situation | Response |
+|-----------|----------|
+| FMU not found | Search with Glob, suggest nearby `.fmu` files |
+| Wrong platform | "This FMU was compiled for `<platform>` and can't run on your OS. Ask the model author for a `<os_tag>` build." |
+| Simulation crash | Show error, suggest reducing step size |
+| `uv` not found | "Install uv: `curl -LsSf https://astral.sh/uv/install.sh \| sh`" |
 
-If `show_widget` is not available (e.g. running in Claude Code terminal only), open the widget in the browser instead:
-```bash
-open <widget_path>   # macOS
-xdg-open <widget_path>   # Linux
-```
-
-**3c — Interpretation**
-
-Give a brief plain-language summary: what the outputs represent, whether the simulation looks healthy, and any notable behaviour (oscillations, settling, saturation, drift).
-
-## Step 4 — Handle errors
-
-| Error | Friendly explanation to give the user |
-|-------|----------------------------------------|
-| FMU file not found | "The file wasn't found at that path. Let me search for .fmu files nearby…" then use Glob |
-| Wrong platform | "This FMU was compiled for Windows/Linux and can't run on your Mac. Ask the model author for a macOS (darwin64) build." |
-| Simulation crash | "The simulation failed — this can happen with a step size that's too large. Try adding `step=0.001` to use a finer time step." |
-| `uv` not found | "uv isn't installed. Install it with: `curl -Lsf https://astral.sh/uv/install.sh | sh`" |
-| FMI version error | "This FMU uses FMI version X, which may require a newer version of fmpy. Run: `uv run --with fmpy python3 -c \"import fmpy; print(fmpy.__version__)\"` to check." |
+---
 
 ## Usage examples
 
 ```
 /fmpy-simulate ./models/BouncingBall.fmu
-/fmpy-simulate ./models/BouncingBall.fmu stop=5 step=0.001
-/fmpy-simulate ./models/BouncingBall.fmu start=1 stop=20 out=./results/bb.csv
-/fmpy-simulate /path/to/model.fmu stop=100 step=0.05
+/fmpy-simulate ./models/fopdt_pi.fmu
 ```
