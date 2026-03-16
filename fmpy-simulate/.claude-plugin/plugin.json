@@ -1,0 +1,11 @@
+{
+  "name": "fmpy-simulate",
+  "description": "Simulate FMU models using FMPy. Adds a /fmpy-simulate skill for inspecting and running Functional Mock-up Units (FMI 1.0/2.0/3.0).",
+  "version": "0.1.0",
+  "author": {
+    "name": "Christoffer Björkskog",
+    "email": "christoffer.bjorkskog@novia.fi"
+  },
+  "keywords": ["fmu", "fmpy", "fmi", "simulation", "control", "modelica"],
+  "category": "engineering"
+}

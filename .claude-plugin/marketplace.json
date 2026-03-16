@@ -1,0 +1,24 @@
+{
+  "name": "graceful-ai-skills",
+  "owner": {
+    "name": "Novia University of Applied Sciences",
+    "email": "christoffer.bjorkskog@novia.fi"
+  },
+  "metadata": {
+    "description": "Claude Code skills and plugins for engineering, simulation, and AI workflows."
+  },
+  "plugins": [
+    {
+      "name": "fmpy-simulate",
+      "source": "./fmpy-simulate",
+      "description": "Simulate FMU models using FMPy (FMI 1.0/2.0/3.0, CoSimulation & ModelExchange)",
+      "version": "0.1.0",
+      "author": {
+        "name": "Christoffer Björkskog",
+        "email": "christoffer.bjorkskog@novia.fi"
+      },
+      "category": "engineering",
+      "tags": ["fmu", "fmpy", "fmi", "simulation", "control"]
+    }
+  ]
+}

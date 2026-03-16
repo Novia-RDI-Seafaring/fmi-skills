@@ -1,0 +1,5 @@
+# Project-local Claude dev copies (not part of the distributable plugin)
+.claude/
+
+# macOS
+.DS_Store
