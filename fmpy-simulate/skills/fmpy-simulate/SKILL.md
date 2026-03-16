@@ -56,6 +56,20 @@ dump(FMU_PATH)
 
 md = read_model_description(FMU_PATH)
 
+# ── 2b. List tunable parameters ───────────────────────────────────────────────
+params = [v for v in md.modelVariables if v.causality == 'parameter']
+if params:
+    print("\nTunable Parameters")
+    print(f"  {'Name':<25} {'Start Value':>15}  {'Unit':<10}  Description")
+    print("  " + "-" * 70)
+    for v in params:
+        val  = v.start if v.start is not None else "—"
+        unit = v.unit  if v.unit  is not None else ""
+        desc = v.description if v.description else ""
+        print(f"  {v.name:<25} {str(val):>15}  {unit:<10}  {desc}")
+else:
+    print("\nNo tunable parameters found.")
+
 # ── 3. Platform check ─────────────────────────────────────────────────────────
 system = _platform.system().lower()
 os_tag = "darwin64" if system == "darwin" else "linux64" if system == "linux" else "win64"
